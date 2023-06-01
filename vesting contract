@@ -1,0 +1,292 @@
+use anchor_lang::{prelude::*,AnchorSerialize,AnchorDeserialize,solana_program::{system_instruction,program::{invoke}}};
+use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer};
+
+declare_id!("1ockKL5chR89E4K576QfJP6jeW9v5cNoPjxKyZmJ7us");
+
+#[program]
+pub mod vesting {
+    use super::*;
+
+    pub fn create_fee_data_account(
+        ctx: Context<CreateFeeDataAccount>,
+        )->ProgramResult{
+        let fee_data = &mut ctx.accounts.fee_data;
+        fee_data.authority = ctx.accounts.authority.key();
+        Ok(())
+    }
+
+    pub fn update_fee_data(
+        ctx: Context<UpdateFeeData>,
+        _fee_data: Vec<Fee>
+        )->ProgramResult{
+        let fee_data = &mut ctx.accounts.fee_data;
+        fee_data.fee_data = _fee_data;
+        Ok(())
+    }
+
+    pub fn update_fee_exception_wallets(
+        ctx: Context<UpdateFeeData>,
+        _fee_exception_wallets: Vec<Pubkey>,
+        )->ProgramResult{
+        let fee_data = &mut ctx.accounts.fee_data;
+        fee_data.fee_exception_wallets = _fee_exception_wallets;
+        Ok(())
+    }
+
+    pub fn update_fee_authority(
+        ctx: Context<UpdateFeeData>,
+        _fee_authority: Pubkey
+        )->ProgramResult{
+        let fee_data = &mut ctx.accounts.fee_data;
+        fee_data.authority = _fee_authority;
+        Ok(())
+    }
+
+    pub fn create_vesting<'a,'b,'c,'info>(
+        ctx : Context<'_,'_,'_,'info, CreateVesting<'info>>,
+        _seed : String,
+        _bump : u8,
+        _schedule : Vec<Schedule>
+        ) -> ProgramResult {
+        let owner = ctx.accounts.owner.key();
+        let fee_data = &ctx.accounts.fee_data;
+        let pool = &mut ctx.accounts.pool;
+        let clock = (&ctx.accounts.clock).unix_timestamp as u64;
+        
+        let mut is_exception = false;
+        for r in fee_data.fee_exception_wallets.iter(){
+            if *r==owner{
+                is_exception = true;
+                break;
+            }
+        }
+
+        if !is_exception {
+            let wallets = &ctx.remaining_accounts;
+            for (i, r) in fee_data.fee_data.iter().enumerate(){
+                let w = &wallets[i];
+                if r.address!=*w.key{
+                    return Err(PoolError::InvalidFeeWallets.into());
+                }
+                invoke(
+                    &system_instruction::transfer(
+                        &owner,
+                        &r.address,
+                        r.amount
+                    ),
+                    &[
+                        w.clone(),
+                        ctx.accounts.owner.to_account_info().clone(),
+                        ctx.accounts.system_program.to_account_info().clone()
+                    ]
+                )?;
+            }
+        }
+
+        let mut total : u64 =0;
+        for s in _schedule.iter() {
+            total += s.amount;
+        }
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info().clone(),
+            Transfer{
+                from : ctx.accounts.source_account.to_account_info().clone(),
+                to : ctx.accounts.token_account.to_account_info().clone(),
+                authority : ctx.accounts.owner.to_account_info().clone()
+            }
+        );
+        token::transfer(cpi_ctx, total)?;
+        pool.owner = ctx.accounts.owner.key();
+        pool.created_time = clock;
+        pool.token_mint = ctx.accounts.token_mint.key();
+        pool.token_account = ctx.accounts.token_account.key();
+        pool.seed = _seed;
+        pool.schedule = _schedule;
+        pool.bump = _bump;
+        Ok(())
+    }
+
+    pub fn unlock(
+        ctx : Context<Unlock>,
+        ) ->ProgramResult {
+        let pool = &mut ctx.accounts.pool;
+        let clock = (&ctx.accounts.clock).unix_timestamp as u64;
+        let mut total : u64 =0;
+        for s in pool.schedule.iter_mut() {
+            if clock > s.release_time{
+                total += s.amount;
+                s.amount = 0;
+            }
+        }
+        let pool_signer_seeds = &[(&pool.seed).as_bytes(),&[pool.bump]];
+        let signer = &[&pool_signer_seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info().clone(),
+            Transfer{
+                from : ctx.accounts.token_account.to_account_info().clone(),
+                to : ctx.accounts.dest_account.to_account_info().clone(),
+                authority : pool.to_account_info().clone(),
+            },
+            signer
+        );
+        token::transfer(cpi_ctx, total)?;
+        Ok(())
+    }
+
+    pub fn transfer_ownership(
+        ctx : Context<TransferOwnership>,
+        _new_owner : Pubkey,
+        ) -> ProgramResult {
+        let pool = &mut ctx.accounts.pool;
+        pool.owner = _new_owner;
+        Ok(())
+    }
+
+    pub fn close_pool(
+        ctx : Context<ClosePool>
+        )->ProgramResult{
+        let owner = &mut ctx.accounts.owner;
+        let pool = &mut ctx.accounts.pool;
+        let mut total : u64 = 0;
+        for s in pool.schedule.iter_mut(){
+            total += s.amount;
+        }
+        if total!=0{
+            return Err(PoolError::PoolNotEmpty.into());
+        }
+        let snapshot : u64 = pool.to_account_info().lamports();
+        **pool.to_account_info().lamports.borrow_mut() = 0;
+        **owner.lamports.borrow_mut() = owner.lamports().checked_add(snapshot).ok_or(PoolError::NumericalOverflowError)?;
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct ClosePool<'info>{
+    #[account(mut)]
+    owner : Signer<'info>,
+
+    #[account(mut, has_one=owner)]
+    pool : Account<'info, Pool>,    
+}
+
+#[derive(Accounts)]
+pub struct TransferOwnership<'info>{
+    #[account(mut)]
+    owner : Signer<'info>,
+
+    #[account(mut, has_one=owner)]
+    pool : Account<'info, Pool>,
+}
+
+#[derive(Accounts)]
+pub struct Unlock<'info>{
+    #[account(mut)]
+    owner: Signer<'info>,
+
+    #[account(mut, has_one=token_account, constraint=pool.owner==owner.key())]
+    pool : Account<'info, Pool>,
+
+    #[account(mut)]
+    token_account : Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    dest_account : Account<'info, TokenAccount>,
+
+    token_program : Program<'info, Token>,
+
+    clock : Sysvar<'info, Clock>,
+}
+
+#[derive(Accounts)]
+#[instruction(_seed : String)]
+pub struct CreateVesting<'info>{
+    fee_data : Account<'info, FeeData>,
+
+    #[account(mut)]
+    owner : Signer<'info>,
+
+    #[account(init, seeds=[(&_seed).as_bytes()], bump, payer=owner, space=8+POOL_SIZE)]
+    pool : Account<'info, Pool>,
+
+    #[account(owner=spl_token::id())]
+    token_mint : Account<'info, Mint>,
+
+    #[account(mut, constraint=source_account.owner==owner.key() && source_account.mint==token_mint.key())]
+    source_account : Account<'info, TokenAccount>,
+
+    #[account(mut, constraint=token_account.owner==pool.key() && token_account.mint==token_mint.key())]
+    token_account : Account<'info, TokenAccount>,
+
+    token_program : Program<'info, Token>,
+
+    system_program : Program<'info, System>,
+
+    clock: Sysvar<'info, Clock>
+}
+
+#[derive(Accounts)]
+pub struct UpdateFeeData<'info>{
+    #[account(mut)]
+    authority : Signer<'info>,
+
+    #[account(mut, has_one=authority)]
+    fee_data: Account<'info, FeeData>,
+}
+
+#[derive(Accounts)]
+pub struct CreateFeeDataAccount<'info>{
+    #[account(mut)]
+    authority : Signer<'info>,
+
+    #[account(init, seeds=[FEE_ACCOUNT_PREFIX.as_bytes()], bump, payer=authority, space=8+FEE_DATA_SIZE)]
+    fee_data : Account<'info, FeeData>,
+
+    system_program : Program<'info, System>,
+}
+
+pub const FEE_ACCOUNT_PREFIX : &str = "Fee Account";
+pub const FEE_DATA_SIZE : usize = 32 + 4 + 40 * 10 + 4 + 32 * 10;
+pub const POOL_SIZE : usize = 32 + 8 + 32 + 32 + 4 + 32 + 4 + 16 * 40 + 1;
+
+#[account]
+pub struct FeeData {
+    pub authority : Pubkey,
+    pub fee_data : Vec<Fee>,
+    pub fee_exception_wallets : Vec<Pubkey>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone, Copy)]
+pub struct Fee{
+    pub address : Pubkey,
+    pub amount : u64,
+}
+
+#[account]
+pub struct Pool {
+    pub owner : Pubkey,
+    pub created_time : u64,
+    pub token_mint : Pubkey,
+    pub token_account : Pubkey,
+    pub seed : String,
+    pub schedule : Vec<Schedule>,
+    pub bump : u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone, Copy)]
+pub struct Schedule{
+    pub release_time : u64,
+    pub amount : u64,
+}
+
+#[error]
+pub enum PoolError{
+    #[msg("Invalid fee wallets")]
+    InvalidFeeWallets,
+
+    #[msg("Pool not empty")]
+    PoolNotEmpty,
+
+    #[msg("Numerical overflow error")]
+    NumericalOverflowError,
+}
